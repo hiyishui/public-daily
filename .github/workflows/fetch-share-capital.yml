@@ -1,0 +1,96 @@
+# 功能：
+# - 每日或手动生成最新股本 parquet 文件集。
+# - 将 canonical 文件推送到数据仓 `larkself/gp-guben/data/gb/YYYY/end_YYYYMMDD.parquet`，
+#   避免每天把全量快照写进代码仓历史。
+# - 支持按 `END_DATE` 起止日期抓取；未传时默认抓取当天。
+#
+# 用法：
+# - GitHub Actions 可通过 `workflow_dispatch` 手动触发。
+# - 手动触发可选填写 `start_date` / `end_date`；留空时两者都默认为当天。
+# - 也会按计划任务自动执行；命令入口仍然是 `python -m my_stock basic fetch-share-capital`，
+#   默认会先写到 `GP_RUNTIME_ROOT/basic/gb/`，再发布到 `larkself/gp-guben`。
+name: 股本更新
+
+on:
+  schedule:
+    # 每个工作日北京时间 2:00 执行（UTC 前一天 18:00，周日~周四）
+    - cron: '0 18 * * 0-4'
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "起始 END_DATE，格式 YYYY-MM-DD，留空默认当天"
+        required: false
+        type: string
+      end_date:
+        description: "结束 END_DATE，格式 YYYY-MM-DD，留空默认与起始日期相同"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fetch-share-capital
+  cancel-in-progress: false
+
+jobs:
+  fetch-share-capital:
+    runs-on: ubuntu-latest
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_GUBEN_REPO: gp-guben
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - name: Check out my-stock source repo
+        uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          fetch-depth: 0
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ./my-stock-src
+
+      - name: Sync gp-guben
+        run: python -m my_stock common sync-repo gp-guben
+
+      - name: Resolve date range
+        id: date_range
+        shell: bash
+        run: |
+          set -euo pipefail
+          TODAY="$(date +%F)"
+          START_DATE="${{ github.event.inputs.start_date }}"
+          END_DATE="${{ github.event.inputs.end_date }}"
+          if [ -z "${START_DATE}" ]; then
+            START_DATE="${TODAY}"
+          fi
+          if [ -z "${END_DATE}" ]; then
+            END_DATE="${START_DATE}"
+          fi
+          echo "start_date=${START_DATE}" >> "${GITHUB_OUTPUT}"
+          echo "end_date=${END_DATE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and publish share capital partitions
+        run: |
+          python -m my_stock basic fetch-share-capital \
+            --start-date "${{ steps.date_range.outputs.start_date }}" \
+            --end-date "${{ steps.date_range.outputs.end_date }}"

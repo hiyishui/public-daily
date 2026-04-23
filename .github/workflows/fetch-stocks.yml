@@ -1,0 +1,62 @@
+# 功能：
+# - 每日或手动更新代码仓的股票列表文件 `data/basic/all_stocks.json`。
+# - 执行完成后，如有变化则自动提交并 push 回代码仓（hiyishui/my-stock）。
+#
+# 用法：
+# - GitHub Actions 可通过 `workflow_dispatch` 手动触发。
+# - 也会按计划任务自动执行；命令入口为 `python -m my_stock basic fetch-stocks`。
+name: 股票列表更新
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每个工作日北京时间 3:00 执行（UTC 前一天 19:00，周日~周四）
+    - cron: '0 19 * * 0-4'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fetch-stocks
+  cancel-in-progress: false
+
+jobs:
+  fetch-stocks:
+    runs-on: ubuntu-latest
+    env:
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - name: Check out my-stock source repo
+        uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          fetch-depth: 0
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install './my-stock-src[provider]'
+
+      - name: Update stock universe
+        run: python -m my_stock basic fetch-stocks
+
+      - name: Commit and push changes
+        working-directory: my-stock-src
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/basic/all_stocks.json
+          if git diff --cached --quiet; then
+            echo "No stock universe changes."
+            exit 0
+          fi
+          git commit -m "chore: update stock universe"
+          git push

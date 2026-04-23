@@ -1,0 +1,61 @@
+# 功能：
+# - 按季度或手动更新代码仓的交易日历文件 `data/basic/trade_date.json`。
+# - 执行完成后，如有变化则自动提交并 push 回代码仓（hiyishui/my-stock）。
+#
+# 用法：
+# - GitHub Actions 可通过 `workflow_dispatch` 手动触发。
+# - 也会按计划任务自动执行；命令入口为 `python -m my_stock basic fetch-trade-dates`。
+name: 交易日更新
+
+on:
+  schedule:
+    - cron: '0 18 * * 5'  # UTC 18:00 Fri = 北京 02:00 Sat, 每周更新一次
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fetch-trade-dates
+  cancel-in-progress: false
+
+jobs:
+  fetch-trade-dates:
+    runs-on: ubuntu-latest
+    env:
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - name: Check out my-stock source repo
+        uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          fetch-depth: 0
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install './my-stock-src[provider]'
+
+      - name: Update trade dates
+        run: python -m my_stock basic fetch-trade-dates
+
+      - name: Commit and push changes
+        working-directory: my-stock-src
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/basic/trade_date.json
+          if git diff --cached --quiet; then
+            echo "No trade date changes."
+            exit 0
+          fi
+          git commit -m "chore: update trade dates"
+          git push

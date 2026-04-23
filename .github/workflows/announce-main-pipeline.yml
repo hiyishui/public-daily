@@ -1,0 +1,441 @@
+name: 公告日常主链
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_range:
+        description: "日期范围，支持 YYYY / YYYYMM / YYYYMMDD / start~end；留空=当天"
+        required: false
+        default: ""
+        type: string
+      high_only:
+        description: "是否只保留高优先级候选"
+        required: false
+        default: false
+        type: boolean
+      batch_size:
+        description: "每个内容批次的公告数量（单 IP 限流约 50）"
+        required: false
+        default: "50"
+        type: string
+  # schedule:
+  #   - cron: "30 3 * * 1-5"   # UTC 03:30 = CST 11:30
+
+permissions:
+  contents: read
+
+concurrency:
+  group: announce-main-pipeline
+  cancel-in-progress: false
+
+# ──────────────────────────────────────────────────────────────────
+jobs:
+
+  # ─── 1. prepare ──────────────────────────────────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      has_work: ${{ steps.trade_guard.outputs.should_run }}
+      skip_reason: ${{ steps.trade_guard.outputs.skip_reason }}
+      start: ${{ steps.range.outputs.start }}
+      end: ${{ steps.range.outputs.end }}
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+      INPUT_DATE_RANGE: ${{ inputs.date_range || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Resolve date range
+        id: range
+        run: python -m my_stock announce resolve-date-range --date-range "${INPUT_DATE_RANGE}"
+
+      - name: Check trading-day coverage
+        id: trade_guard
+        run: |
+          python -m my_stock announce check-trading-day-coverage \
+            --start "${{ steps.range.outputs.start }}" \
+            --end "${{ steps.range.outputs.end }}" \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json"
+
+  # ─── skip ────────────────────────────────────────────────────
+  skip_pipeline:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_work != 'true'
+    steps:
+      - run: echo "${{ needs.prepare.outputs.skip_reason }}"
+
+  # ─── 2. fetch_list ──────────────────────────────────────────
+  fetch_list:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_work == 'true'
+    timeout-minutes: 30
+    outputs:
+      has_batches: ${{ steps.enumerate.outputs.has_batches }}
+      batches_matrix: ${{ steps.enumerate.outputs.batches_matrix }}
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+      INPUT_HIGH_ONLY: ${{ inputs.high_only || 'false' }}
+      INPUT_BATCH_SIZE: ${{ inputs.batch_size || '50' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Sync year repos
+        run: |
+          python -m my_stock announce sync-year-repos \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}"
+
+      - name: Fetch announcement list
+        run: |
+          python -m my_stock announce fetch-list \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}" \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --append \
+            --no-push \
+            --summary-output "${RUNNER_TEMP}/announce-fetch-list-summary.json"
+
+      - name: Publish list to year repos
+        run: |
+          python -m my_stock announce publish-list-summary \
+            --summary-path "${RUNNER_TEMP}/announce-fetch-list-summary.json" \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}"
+
+      - name: Filter candidates
+        run: |
+          python -m my_stock announce filter-candidates-workflow \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}" \
+            --list-root "${GP_RUNTIME_ROOT}/announce/list" \
+            --high-only-text "${INPUT_HIGH_ONLY}" \
+            --no-push \
+            --summary-output "${RUNNER_TEMP}/announce-filter-candidates-summary.json"
+
+      - name: Generate content batches
+        run: |
+          python -m my_stock announce generate-content-batches \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}" \
+            --candidate-root "${GP_RUNTIME_ROOT}/announce/candidates" \
+            --batch-size "${INPUT_BATCH_SIZE}" \
+            --summary-output "${RUNNER_TEMP}/announce-generate-content-batches-summary.json"
+
+      - name: Enumerate content batches for matrix
+        id: enumerate
+        run: |
+          python -m my_stock announce enumerate-content-batches \
+            --batch-dir "${GP_RUNTIME_ROOT}/announce/content_batches" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Upload batch files as artifact
+        if: steps.enumerate.outputs.has_batches == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: announce-content-batches
+          path: ${{ env.GP_RUNTIME_ROOT }}/announce/content_batches/
+          retention-days: 1
+
+      - name: Upload list summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: announce-pipeline-list-summary
+          path: |
+            ${{ runner.temp }}/announce-fetch-list-summary.json
+            ${{ runner.temp }}/announce-filter-candidates-summary.json
+            ${{ runner.temp }}/announce-generate-content-batches-summary.json
+          retention-days: 3
+
+  # ─── 3. fetch_content (matrix parallel) ─────────────────────
+  fetch_content:
+    runs-on: ubuntu-latest
+    needs: [prepare, fetch_list]
+    if: needs.fetch_list.outputs.has_batches == 'true'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.fetch_list.outputs.batches_matrix) }}
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Download batch files
+        uses: actions/download-artifact@v5
+        with:
+          name: announce-content-batches
+          path: ${{ runner.temp }}/content-batches
+
+      - name: Fetch content for batch
+        run: |
+          BATCH_FILE="${RUNNER_TEMP}/content-batches/${{ matrix.batch }}"
+          RUNNER_IDX=$(echo "${{ matrix.batch }}" | sed -n 's/batch_\([0-9]*\)\..*/\1/p')
+          python -m my_stock announce fetch-content-worker \
+            --codes-file "${BATCH_FILE}" \
+            --runner-idx "${RUNNER_IDX}" \
+            --output-dir "${RUNNER_TEMP}/content_output" \
+            --timeout 10 \
+            --summary-output "${RUNNER_TEMP}/announce-content-summary.json"
+
+      - name: Upload content artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: announce-content-${{ matrix.batch }}
+          path: ${{ runner.temp }}/content_output/
+          retention-days: 1
+          if-no-files-found: warn
+
+  # ─── 4. publish_content ─────────────────────────────────────
+  publish_content:
+    runs-on: ubuntu-latest
+    needs: [prepare, fetch_list, fetch_content]
+    if: needs.fetch_list.outputs.has_batches == 'true'
+    timeout-minutes: 15
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Sync year repos
+        run: |
+          python -m my_stock announce sync-year-repos \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}"
+
+      - name: Download all content artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: announce-content-*
+          path: ${{ runner.temp }}/collected_content
+          merge-multiple: true
+
+      - name: Merge content fragments
+        run: |
+          python -m my_stock announce merge-content-fragments \
+            --input-root "${RUNNER_TEMP}/collected_content" \
+            --batch-id "pipeline" \
+            --no-push \
+            --summary-output "${RUNNER_TEMP}/announce-merge-summary.json"
+
+      - name: Publish content to year repos
+        run: |
+          python -m my_stock announce publish-content-and-cleanup \
+            --artifact-dir "${GP_RUNTIME_ROOT}/announce/raw/content" \
+            --summary-output "${RUNNER_TEMP}/announce-publish-content-summary.json"
+
+  # ─── 5. extract_base (L1) ───────────────────────────────────
+  extract_base:
+    runs-on: ubuntu-latest
+    needs: [prepare, fetch_list, publish_content]
+    if: |
+      always() &&
+      needs.prepare.outputs.has_work == 'true' &&
+      (needs.publish_content.result == 'success' || needs.publish_content.result == 'skipped')
+    timeout-minutes: 30
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Sync feature repos
+        run: |
+          python -m my_stock announce sync-feature-repos \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}"
+
+      - name: "L1: Extract base features"
+        run: |
+          python -m my_stock announce extract-base-features \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}" \
+            --summary-output "${RUNNER_TEMP}/announce-base-features-summary.json"
+
+      - name: Publish L1 features
+        run: |
+          python -m my_stock announce publish-feature-summary \
+            --summary-path "${RUNNER_TEMP}/announce-base-features-summary.json" \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}" \
+            --max-rows-per-file 800000
+
+  # ─── 6. derive_history (L2H) ────────────────────────────────
+  derive_history:
+    runs-on: ubuntu-latest
+    needs: [prepare, extract_base]
+    if: needs.prepare.outputs.has_work == 'true'
+    timeout-minutes: 30
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Sync feature repos
+        run: |
+          python -m my_stock announce sync-feature-repos \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}"
+
+      - name: "L2H: Derive history features"
+        run: |
+          python -m my_stock announce derive-history-features \
+            --input-root "${GP_REPOS_ROOT}/gp-announce-features/data/announce/features" \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}" \
+            --summary-output "${RUNNER_TEMP}/announce-derive-history-summary.json"
+
+      - name: Publish L2H features
+        run: |
+          python -m my_stock announce publish-feature-summary \
+            --summary-path "${RUNNER_TEMP}/announce-derive-history-summary.json" \
+            --start "${{ needs.prepare.outputs.start }}" \
+            --end "${{ needs.prepare.outputs.end }}" \
+            --target-repo gp-announce-derived \
+            --max-rows-per-file 800000

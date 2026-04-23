@@ -1,0 +1,689 @@
+name: 盘口日常主链
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "日期 YYYYMMDD；留空=当天（需已收盘）"
+        required: false
+        default: ""
+        type: string
+      codes:
+        description: "可选股票代码逗号分隔；留空=全部"
+        required: false
+        default: ""
+        type: string
+  # schedule:
+  #   - cron: "30 8 * * 1-5"   # UTC 08:30 = CST 16:30
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pankou-main-pipeline
+  cancel-in-progress: false
+
+# ──────────────────────────────────────────────────────────────────
+jobs:
+
+  # ─── 1. prepare ──────────────────────────────────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      has_work: ${{ steps.matrix.outputs.has_work }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      dates_matrix: ${{ steps.matrix.outputs.dates_matrix }}
+      resolved_date: ${{ steps.matrix.outputs.resolved_date }}
+      skip_reason: ${{ steps.matrix.outputs.skip_reason }}
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_CODE_REPO: my-stock
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Resolve date and generate download matrix
+        id: matrix
+        env:
+          INPUT_DATE: ${{ inputs.date || '' }}
+          INPUT_CODES: ${{ inputs.codes || '' }}
+        run: |
+          set -euo pipefail
+          python -m my_stock common guard-trade-date \
+            --date "${INPUT_DATE}" \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --output "${RUNNER_TEMP}/trade-guard.json"
+          python -m my_stock pankou resolve-download-guard \
+            --guard-file "${RUNNER_TEMP}/trade-guard.json" \
+            --stocks-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/all_stocks.json" \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --codes "${INPUT_CODES}" \
+            --exclude-bj-star \
+            --github-output "${GITHUB_OUTPUT}"
+
+  # ─── 2. skip_pipeline ───────────────────────────────────────
+  skip_pipeline:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_work != 'true'
+    steps:
+      - run: echo "${{ needs.prepare.outputs.skip_reason }}"
+
+  # ─── 3. download (parallel shards) ──────────────────────────
+  download:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_work == 'true'
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Download raw shard
+        env:
+          SHARD_DATE: ${{ matrix.date }}
+          SHARD_SECIDS_JSON: ${{ toJson(matrix.secids) }}
+          SHARD_ALL_SECIDS: ${{ matrix.all_secids }}
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          if [ "${SHARD_ALL_SECIDS}" = "true" ]; then
+            python -m my_stock pankou download-raw \
+              --date "${SHARD_DATE}" \
+              --output-root "${RUNNER_TEMP}/dl_output" \
+              --summary-output "${RUNNER_TEMP}/download-summary-${SHARD_INDEX}.json" \
+              --exclude-bj-star \
+              --all-secids \
+              --stocks-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/all_stocks.json"
+          else
+            python -m my_stock pankou download-raw \
+              --date "${SHARD_DATE}" \
+              --output-root "${RUNNER_TEMP}/dl_output" \
+              --summary-output "${RUNNER_TEMP}/download-summary-${SHARD_INDEX}.json" \
+              --exclude-bj-star \
+              --secids-json "${SHARD_SECIDS_JSON}"
+          fi
+
+      - name: Upload raw shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: pankou-raw-${{ matrix.date }}-shard${{ matrix.shard }}
+          path: ${{ runner.temp }}/dl_output/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  # ─── 4. push_date_repo ──────────────────────────────────────
+  push_date_repo:
+    runs-on: ubuntu-latest
+    needs: [prepare, download]
+    if: needs.prepare.outputs.has_work == 'true'
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.dates_matrix) }}
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: pankou-raw-${{ matrix.date }}-*
+          path: ${{ runner.temp }}/collected
+          merge-multiple: true
+
+      - name: Push to date repo
+        run: |
+          python -m my_stock pankou push-date-repo \
+            --data-dir "${RUNNER_TEMP}/collected" \
+            --date "${{ matrix.date }}"
+
+  # ─── 5a. extract_base_shard (L1, parallel) ───────────────────
+  extract_base_shard:
+    runs-on: ubuntu-latest
+    needs: [prepare, download]
+    if: needs.prepare.outputs.has_work == 'true'
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_GUBEN_REPO: gp-guben
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Download shard artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: pankou-raw-${{ matrix.date }}-shard${{ matrix.shard }}
+          path: ${{ runner.temp }}/raw_data
+
+      - name: Sync gp-guben
+        run: python -m my_stock common sync-repo gp-guben
+
+      - name: "L1: Extract base features (shard)"
+        run: |
+          python -m my_stock pankou extract-base-features \
+            --date "${{ matrix.date }}" \
+            --data-dir "${RUNNER_TEMP}/raw_data" \
+            --guben-dir "${GP_REPOS_ROOT}/gp-guben/data/gb" \
+            --output-root "${RUNNER_TEMP}/base_output" \
+            --summary-output "${RUNNER_TEMP}/pankou-extract-base-summary.json"
+
+      - name: Upload partial base parquet
+        uses: actions/upload-artifact@v4
+        with:
+          name: pankou-base-${{ matrix.date }}-shard${{ matrix.shard }}
+          path: ${{ runner.temp }}/base_output/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ─── 5b. merge_and_publish_base ─────────────────────────────
+  merge_and_publish_base:
+    runs-on: ubuntu-latest
+    needs: [prepare, extract_base_shard]
+    if: needs.prepare.outputs.has_work == 'true'
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.dates_matrix) }}
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_PANKOU_REPO: gp-pankou
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Download all base shard parquets
+        uses: actions/download-artifact@v5
+        with:
+          pattern: pankou-base-${{ matrix.date }}-*
+          path: ${{ runner.temp }}/base_shards
+
+      - name: Merge shard parquets
+        run: |
+          python -c "
+          import pathlib, pandas as pd
+          shards = sorted(pathlib.Path('${RUNNER_TEMP}/base_shards').rglob('*.parquet'))
+          print(f'Merging {len(shards)} shard parquet(s)')
+          frames = [pd.read_parquet(p) for p in shards]
+          merged = pd.concat(frames, ignore_index=True).sort_values(['secid','date']).reset_index(drop=True)
+          compact = '${{ matrix.date }}'.replace('-','')
+          year = compact[:4]
+          out = pathlib.Path('${RUNNER_TEMP}/gp-data/runtime/pankou/base/pankou') / year / f'{compact}.parquet'
+          out.parent.mkdir(parents=True, exist_ok=True)
+          merged.to_parquet(out, index=False)
+          print(f'Written {len(merged)} rows to {out}')
+          "
+
+      - name: Sync gp-pankou (sparse)
+        run: |
+          YEAR=$(echo "${{ matrix.date }}" | tr -d '-' | cut -c1-4)
+          python -m my_stock common sync-repo gp-pankou \
+            --sparse-path "${YEAR}/"
+
+      - name: Canonicalize base
+        run: |
+          python -m my_stock pankou canonicalize-base \
+            --date "${{ matrix.date }}"
+
+      - name: Publish base to gp-pankou
+        run: python -m my_stock pankou publish-base --date "${{ matrix.date }}"
+
+  # ─── 6a. derive_history_shard (L2H, parallel) ────────────────
+  derive_history_shard:
+    runs-on: ubuntu-latest
+    needs: [prepare, merge_and_publish_base]
+    if: needs.prepare.outputs.has_work == 'true'
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_PANKOU_REPO: gp-pankou
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+      INPUT_HISTORY_DAYS: "60"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Resolve sparse paths for gp-pankou
+        id: sparse
+        run: |
+          python -m my_stock common resolve-lookback-paths \
+            --date "${{ matrix.date }}" \
+            --lookback "${INPUT_HISTORY_DAYS}" \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Sync gp-pankou (sparse)
+        run: python -m my_stock common sync-repo gp-pankou ${{ steps.sparse.outputs.sparse_args }}
+
+      - name: "L2H: Derive history features (shard)"
+        run: |
+          python -m my_stock pankou derive-features \
+            --date "${{ matrix.date }}" \
+            --base-dir "${GP_REPOS_ROOT}/gp-pankou" \
+            --history-days "${INPUT_HISTORY_DAYS}" \
+            --secids-json '${{ toJson(matrix.secids) }}' \
+            --output-root "${RUNNER_TEMP}/derived_output" \
+            --summary-output "${RUNNER_TEMP}/pankou-derive-summary.json"
+
+      - name: Upload partial derived parquets
+        uses: actions/upload-artifact@v4
+        with:
+          name: pankou-derived-${{ matrix.date }}-shard${{ matrix.shard }}
+          path: ${{ runner.temp }}/derived_output/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ─── 6b. merge_and_publish_derived ──────────────────────────
+  merge_and_publish_derived:
+    runs-on: ubuntu-latest
+    needs: [prepare, derive_history_shard]
+    if: needs.prepare.outputs.has_work == 'true'
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.dates_matrix) }}
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_DERIVED_REPO: gp-derived
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Download all derived shard parquets
+        uses: actions/download-artifact@v5
+        with:
+          pattern: pankou-derived-${{ matrix.date }}-*
+          path: ${{ runner.temp }}/derived_shards
+
+      - name: Merge shard derived parquets
+        run: |
+          python -c "
+          import pathlib, pandas as pd
+          compact = '${{ matrix.date }}'.replace('-','')
+          year = compact[:4]
+          runtime = pathlib.Path('${RUNNER_TEMP}/gp-data/runtime/pankou/derived')
+          for sub in ['market_structure', 'trade_behavior']:
+              shards = sorted(pathlib.Path('${RUNNER_TEMP}/derived_shards').rglob(f'{sub}/**/*.parquet'))
+              if not shards:
+                  shards = sorted(pathlib.Path('${RUNNER_TEMP}/derived_shards').rglob(f'**/{sub}/{year}/{compact}.parquet'))
+              print(f'{sub}: merging {len(shards)} shard(s)')
+              frames = [pd.read_parquet(p) for p in shards]
+              merged = pd.concat(frames, ignore_index=True).sort_values('secid').reset_index(drop=True)
+              out = runtime / sub / year / f'{compact}.parquet'
+              out.parent.mkdir(parents=True, exist_ok=True)
+              merged.to_parquet(out, index=False)
+              print(f'{sub}: {len(merged)} rows -> {out}')
+          "
+
+      - name: Sync gp-derived
+        run: |
+          YEAR=$(echo "${{ matrix.date }}" | tr -d '-' | cut -c1-4)
+          python -m my_stock common sync-repo gp-derived \
+            --sparse-path "history-derived/${YEAR}/"
+
+      - name: Canonicalize derived
+        run: |
+          python -m my_stock pankou canonicalize-derived \
+            --date "${{ matrix.date }}"
+
+      - name: Publish derived to gp-derived
+        run: python -m my_stock pankou publish-derived --date "${{ matrix.date }}"
+
+  # ─── 7a. derive_future_shard (L2F, parallel) ─────────────────
+  derive_future_shard:
+    runs-on: ubuntu-latest
+    needs: [prepare, merge_and_publish_derived]
+    if: needs.prepare.outputs.has_work == 'true'
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_PANKOU_REPO: gp-pankou
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+      INPUT_FUTURE_WINDOW: "20"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Compute L2F target date
+        id: l2f
+        run: |
+          set -euo pipefail
+          L2F_TARGET=$(python -c "
+          import json, pathlib, datetime, zoneinfo
+          td = json.loads(pathlib.Path('my-stock-src/data/basic/trade_date.json').read_text())
+          dates = sorted(d.replace('-','') if '-' in str(d) else str(d) for d in (td.get('trade_dates', td) if isinstance(td, dict) else td))
+          today = datetime.datetime.now(tz=zoneinfo.ZoneInfo('Asia/Shanghai')).strftime('%Y%m%d')
+          idx = next((i for i, d in enumerate(dates) if d >= today), len(dates)) - 1
+          window = int('${INPUT_FUTURE_WINDOW}')
+          target = dates[max(0, idx - window - 1)]
+          print(target)
+          ")
+          echo "target_date=${L2F_TARGET}" >> "$GITHUB_OUTPUT"
+          echo "L2F target date: ${L2F_TARGET}"
+
+      - name: Resolve sparse paths for gp-pankou
+        id: sparse
+        run: |
+          python -m my_stock common resolve-lookahead-paths \
+            --date "${{ steps.l2f.outputs.target_date }}" \
+            --lookahead "${INPUT_FUTURE_WINDOW}" \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Sync gp-pankou (sparse)
+        run: python -m my_stock common sync-repo gp-pankou ${{ steps.sparse.outputs.sparse_args }}
+
+      - name: "L2F: Derive future features (shard)"
+        run: |
+          python -m my_stock pankou derive-future-features \
+            --date "${{ steps.l2f.outputs.target_date }}" \
+            --base-dir "${GP_REPOS_ROOT}/gp-pankou" \
+            --future-window "${INPUT_FUTURE_WINDOW}" \
+            --secids-json '${{ toJson(matrix.secids) }}' \
+            --output-root "${RUNNER_TEMP}/future_output" \
+            --summary-output "${RUNNER_TEMP}/pankou-future-summary.json"
+
+      - name: Upload partial future parquets
+        uses: actions/upload-artifact@v4
+        with:
+          name: pankou-future-${{ steps.l2f.outputs.target_date }}-shard${{ matrix.shard }}
+          path: ${{ runner.temp }}/future_output/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ─── 7b. merge_and_publish_future ───────────────────────────
+  merge_and_publish_future:
+    runs-on: ubuntu-latest
+    needs: [prepare, derive_future_shard]
+    if: needs.prepare.outputs.has_work == 'true'
+    timeout-minutes: 15
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_DERIVED_REPO: gp-derived
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+      INPUT_FUTURE_WINDOW: "20"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Compute L2F target date
+        id: l2f
+        run: |
+          set -euo pipefail
+          L2F_TARGET=$(python -c "
+          import json, pathlib, datetime, zoneinfo
+          td = json.loads(pathlib.Path('my-stock-src/data/basic/trade_date.json').read_text())
+          dates = sorted(d.replace('-','') if '-' in str(d) else str(d) for d in (td.get('trade_dates', td) if isinstance(td, dict) else td))
+          today = datetime.datetime.now(tz=zoneinfo.ZoneInfo('Asia/Shanghai')).strftime('%Y%m%d')
+          idx = next((i for i, d in enumerate(dates) if d >= today), len(dates)) - 1
+          window = int('${INPUT_FUTURE_WINDOW}')
+          target = dates[max(0, idx - window - 1)]
+          print(target)
+          ")
+          echo "target_date=${L2F_TARGET}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all future shard parquets
+        uses: actions/download-artifact@v5
+        with:
+          pattern: pankou-future-${{ steps.l2f.outputs.target_date }}-*
+          path: ${{ runner.temp }}/future_shards
+
+      - name: Merge shard future parquets and recompute z-scores
+        run: |
+          python -c "
+          import pathlib, numpy as np, pandas as pd
+          target = '${{ steps.l2f.outputs.target_date }}'
+          year = target[:4]
+          runtime = pathlib.Path('${RUNNER_TEMP}/gp-data/runtime/pankou/derived')
+          shards = sorted(pathlib.Path('${RUNNER_TEMP}/future_shards').rglob('**/*.parquet'))
+          print(f'future: merging {len(shards)} shard(s)')
+          frames = [pd.read_parquet(p) for p in shards]
+          merged = pd.concat(frames, ignore_index=True).sort_values('secid').reset_index(drop=True)
+          # Recompute cross-sectional z-scores on full dataset
+          for col in ('future_ret_5', 'future_ret_20'):
+              z_col = f'{col}_z'
+              values = pd.to_numeric(merged[col], errors='coerce').to_numpy(dtype=float)
+              finite = np.isfinite(values)
+              if finite.sum() >= 8:
+                  mean = float(np.nanmean(values))
+                  std = float(np.nanstd(values))
+                  if std > 1e-12:
+                      merged[z_col] = np.where(finite, (values - mean) / std, np.nan)
+                  else:
+                      merged[z_col] = np.where(finite, 0.0, np.nan)
+              else:
+                  merged[z_col] = np.nan
+          out = runtime / 'future' / year / f'{target}.parquet'
+          out.parent.mkdir(parents=True, exist_ok=True)
+          merged.to_parquet(out, index=False)
+          print(f'future: {len(merged)} rows -> {out}')
+          "
+
+      - name: Sync gp-derived
+        run: |
+          YEAR=$(echo "${{ steps.l2f.outputs.target_date }}" | cut -c1-4)
+          python -m my_stock common sync-repo gp-derived \
+            --sparse-path "future/${YEAR}/"
+
+      - name: Publish future to gp-derived
+        run: python -m my_stock pankou publish-future --date "${{ steps.l2f.outputs.target_date }}"

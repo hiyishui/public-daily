@@ -1,0 +1,512 @@
+name: 板块主链刷新
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_range:
+        description: "日期范围，支持 2019~2025 / 202601~202603 / 20260401~20260404；留空时默认当天到当天"
+        required: false
+        default: ""
+        type: string
+      snapshot_date:
+        description: "映射快照日期 YYYY-MM-DD；留空时默认使用最新可用快照"
+        required: false
+        default: ""
+        type: string
+  # schedule:
+  #   - cron: "45 12 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: board-main-pipeline
+  cancel-in-progress: false
+
+jobs:
+  resolve_inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      start: ${{ steps.range.outputs.start }}
+      end: ${{ steps.range.outputs.end }}
+      partition_grain: ${{ steps.range.outputs.partition_grain }}
+      should_run: ${{ steps.range.outputs.should_run }}
+      skip_reason: ${{ steps.range.outputs.skip_reason }}
+      snapshot_date: ${{ steps.range.outputs.snapshot_date }}
+    env:
+      INPUT_DATE_RANGE: ${{ github.event.inputs.date_range || '' }}
+      INPUT_SNAPSHOT_DATE: ${{ github.event.inputs.snapshot_date || '' }}
+    steps:
+      - name: Check out my-stock source repo
+        uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Resolve date range
+        id: range
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m my_stock common resolve-date-range \
+            --date-range "${INPUT_DATE_RANGE}" \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --workflow-name "board-main-pipeline" \
+            --precision auto \
+            --check-close \
+            --snapshot-date "${INPUT_SNAPSHOT_DATE}" \
+            --github-output "$GITHUB_OUTPUT"
+
+  skip_pipeline:
+    runs-on: ubuntu-latest
+    needs: resolve_inputs
+    if: needs.resolve_inputs.outputs.should_run != 'true'
+    steps:
+      - name: Report skip reason
+        run: |
+          echo "${{ needs.resolve_inputs.outputs.skip_reason }}"
+
+  fetch_history_shard:
+    runs-on: ubuntu-latest
+    needs: resolve_inputs
+    if: needs.resolve_inputs.outputs.should_run == 'true'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        shard_index: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_CODE_REPO: my-stock
+      GP_BOARD_REPO: gp-board
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+      SHARD_TOTAL: 18
+    steps:
+      - name: Check out my-stock source repo
+        uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+          echo "SHARD_OUTPUT=${RUNNER_TEMP}/shard-output" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Sync gp-board meta only
+        run: |
+          python -m my_stock common sync-repo gp-board \
+            --sparse-path meta/board_codes.csv
+
+      - name: Fetch board history (shard ${{ matrix.shard_index }})
+        run: |
+          python -m my_stock board fetch-history-binary \
+            --meta "${GP_REPOS_ROOT}/gp-board/meta/board_codes.csv" \
+            --output "${SHARD_OUTPUT}" \
+            --manifest-path "${SHARD_OUTPUT}/manifest.json" \
+            --failures-path "${SHARD_OUTPUT}/failures.json" \
+            --binary-failures-path "${SHARD_OUTPUT}/failures_binary.json" \
+            --start "${{ needs.resolve_inputs.outputs.start }}" \
+            --end "${{ needs.resolve_inputs.outputs.end }}" \
+            --partition-grain "${{ needs.resolve_inputs.outputs.partition_grain }}" \
+            --shard-index "${{ matrix.shard_index }}" \
+            --shard-total "${SHARD_TOTAL}" \
+            --shuffle \
+            --no-push \
+            --summary-output "${SHARD_OUTPUT}/summary.json"
+
+      - name: Upload shard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: board-raw-shard-${{ matrix.shard_index }}
+          path: ${{ runner.temp }}/shard-output/
+          if-no-files-found: warn
+          retention-days: 3
+
+  merge_history:
+    runs-on: ubuntu-latest
+    needs: [resolve_inputs, fetch_history_shard]
+    if: needs.resolve_inputs.outputs.should_run == 'true'
+    timeout-minutes: 60
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_CODE_REPO: my-stock
+      GP_BOARD_REPO: gp-board
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - name: Check out my-stock source repo
+        uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Sync gp-board data repo
+        run: |
+          python -m my_stock common sync-repo gp-board \
+            --sparse-path meta/board_codes.csv \
+            --sparse-path raw/bk
+
+      - name: Seed runtime raw board data from gp-board
+        run: |
+          python -m my_stock common seed-tree-copy \
+            --source "${GP_REPOS_ROOT}/gp-board/raw/bk" \
+            --target "${GP_RUNTIME_ROOT}/board/raw/bk"
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: board-raw-shard-*
+          path: ${{ runner.temp }}/shards/
+
+      - name: Merge shard outputs
+        shell: bash
+        env:
+          PARTITION_GRAIN: ${{ needs.resolve_inputs.outputs.partition_grain }}
+          START_DATE: ${{ needs.resolve_inputs.outputs.start }}
+          END_DATE: ${{ needs.resolve_inputs.outputs.end }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          import pandas as pd
+
+          from my_stock.board.models import BoardFailure
+          from my_stock.board.storage import (
+              build_manifest,
+              read_meta,
+              write_failures,
+              write_manifest,
+              write_partitioned_frame,
+          )
+
+          shards_dir = Path(os.environ["RUNNER_TEMP"]) / "shards"
+          output_dir = Path(os.environ["GP_RUNTIME_ROOT"]) / "board" / "raw" / "bk"
+          partition_grain = os.environ["PARTITION_GRAIN"]
+          meta_path = Path(os.environ["GP_REPOS_ROOT"]) / "gp-board" / "meta" / "board_codes.csv"
+
+          # Collect all shard parquets into one DataFrame
+          all_frames: list[pd.DataFrame] = []
+          all_failures: list[BoardFailure] = []
+          shard_summaries: list[dict] = []
+
+          for shard_dir in sorted(shards_dir.iterdir()):
+              if not shard_dir.is_dir():
+                  continue
+              # Read parquets (may be in year subdirs or root)
+              for pq_path in sorted(shard_dir.rglob("*.parquet")):
+                  df = pd.read_parquet(pq_path)
+                  if not df.empty:
+                      all_frames.append(df)
+              # Collect failures
+              for name in ("failures.json", "failures_binary.json"):
+                  fp = shard_dir / name
+                  if fp.exists():
+                      try:
+                          items = json.loads(fp.read_text(encoding="utf-8"))
+                          for item in items:
+                              all_failures.append(
+                                  BoardFailure(
+                                      secid=str(item.get("secid", "")),
+                                      name=str(item.get("name", "")),
+                                      error=str(item.get("error", "")),
+                                  )
+                              )
+                      except Exception:
+                          pass
+                  break  # Only read failures once per shard (failures.json == failures_binary.json)
+              # Collect summaries
+              summary_path = shard_dir / "summary.json"
+              if summary_path.exists():
+                  try:
+                      shard_summaries.append(json.loads(summary_path.read_text(encoding="utf-8")))
+                  except Exception:
+                      pass
+
+          # Deduplicate failures by secid
+          seen_secids: set[str] = set()
+          unique_failures: list[BoardFailure] = []
+          for f in all_failures:
+              if f.secid not in seen_secids:
+                  seen_secids.add(f.secid)
+                  unique_failures.append(f)
+
+          print(f"Shards found: {len(list(shards_dir.iterdir()))}")
+          print(f"Total parquet frames: {len(all_frames)}")
+          print(f"Total unique failures: {len(unique_failures)}")
+
+          # Merge shard data into runtime output (which already has existing gp-board data)
+          if all_frames:
+              combined = pd.concat(all_frames, ignore_index=True)
+              print(f"Combined rows: {len(combined)}")
+              write_partitioned_frame(output_dir, combined, grain=partition_grain, entity_label="boards")
+
+          # Write combined failures
+          failures_path = output_dir / "failures.json"
+          binary_failures_path = output_dir / "failures_binary.json"
+          write_failures(failures_path, unique_failures)
+          write_failures(binary_failures_path, unique_failures)
+
+          # Build and write combined manifest
+          boards = read_meta(meta_path)
+          manifest = build_manifest(
+              output_dir,
+              boards,
+              unique_failures,
+              start=os.environ["START_DATE"],
+              end=os.environ["END_DATE"],
+              source="binary socket protocol (port 1861) — 18-shard parallel fetch",
+          )
+          write_manifest(output_dir / "manifest.json", manifest)
+
+          # Write combined summary
+          combined_summary = {
+              "start": os.environ["START_DATE"],
+              "end": os.environ["END_DATE"],
+              "board_count": len(boards),
+              "remaining_failure_count": len(unique_failures),
+              "partition_grain": partition_grain,
+              "shard_count": len(shard_summaries),
+              "shard_summaries": shard_summaries,
+          }
+          summary_out = Path(os.environ["RUNNER_TEMP"]) / "board-binary-summary.json"
+          summary_out.write_text(json.dumps(combined_summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print("Merge complete.")
+          PY
+
+      - name: Publish runtime raw board data to gp-board
+        run: |
+          python -m my_stock common publish-tree \
+            --source "${GP_RUNTIME_ROOT}/board/raw/bk" \
+            --target "${GP_REPOS_ROOT}/gp-board/raw/bk" \
+            --repo-dir "${GP_REPOS_ROOT}/gp-board" \
+            --git-paths "raw/bk,meta/board_codes.csv" \
+            --message "board: update ${{ needs.resolve_inputs.outputs.start }} to ${{ needs.resolve_inputs.outputs.end }}"
+
+      - name: Upload history summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: board-history-summaries
+          path: ${{ runner.temp }}/board-binary-summary.json
+          if-no-files-found: error
+          retention-days: 7
+
+  build_features:
+    runs-on: ubuntu-latest
+    needs: [resolve_inputs, merge_history]
+    if: needs.resolve_inputs.outputs.should_run == 'true'
+    timeout-minutes: 120
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_CODE_REPO: my-stock
+      GP_BOARD_REPO: gp-board
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - name: Check out my-stock source repo
+        uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Sync gp-board data repo
+        run: |
+          python -m my_stock common sync-repo gp-board \
+            --sparse-path raw/bk \
+            --sparse-path features/bk
+
+      - name: Seed runtime board features from gp-board
+        run: |
+          python -m my_stock common seed-tree-copy \
+            --source "${GP_REPOS_ROOT}/gp-board/features/bk" \
+            --target "${GP_RUNTIME_ROOT}/board/features/bk"
+
+      - name: Build board features  # L1a+L2H combined (extract_base_kline + derived features)
+        run: |
+          python -m my_stock board build-features \
+            --input "${GP_REPOS_ROOT}/gp-board/raw/bk" \
+            --output "${GP_RUNTIME_ROOT}/board/features/bk" \
+            --manifest-path "${GP_RUNTIME_ROOT}/board/features/bk/manifest.json" \
+            --start "${{ needs.resolve_inputs.outputs.start }}" \
+            --end "${{ needs.resolve_inputs.outputs.end }}" \
+            --partition-grain "${{ needs.resolve_inputs.outputs.partition_grain }}" \
+            --no-push \
+            --summary-output "${RUNNER_TEMP}/board-features-summary.json"
+
+      - name: Publish runtime board features to gp-board
+        run: |
+          python -m my_stock common publish-tree \
+            --source "${GP_RUNTIME_ROOT}/board/features/bk" \
+            --target "${GP_REPOS_ROOT}/gp-board/features/bk" \
+            --repo-dir "${GP_REPOS_ROOT}/gp-board" \
+            --git-paths "features/bk" \
+            --message "board-features: update ${{ needs.resolve_inputs.outputs.start }} to ${{ needs.resolve_inputs.outputs.end }}"
+
+      - name: Upload feature summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: board-features-summary
+          path: ${{ runner.temp }}/board-features-summary.json
+          if-no-files-found: error
+          retention-days: 7
+
+  build_stock_features:
+    runs-on: ubuntu-latest
+    needs: [resolve_inputs, build_features]
+    if: needs.resolve_inputs.outputs.should_run == 'true'
+    timeout-minutes: 120
+    env:
+      GP_CODE_GITHUB_OWNER: hiyishui
+      GP_DATA_GITHUB_OWNER: larkself
+      GP_CODE_REPO: my-stock
+      GP_BOARD_REPO: gp-board
+      DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
+      CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
+      MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
+    steps:
+      - name: Check out my-stock source repo
+        uses: actions/checkout@v4
+        with:
+          repository: hiyishui/my-stock
+          ref: main
+          path: my-stock-src
+          token: ${{ secrets.HIYISHUI_PAT }}
+
+      - name: Resolve runtime roots
+        run: |
+          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
+          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
+          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Sync gp-board data repo
+        run: |
+          python -m my_stock common sync-repo gp-board \
+            --sparse-path features/bk \
+            --sparse-path features/stock_daily \
+            --sparse-path meta/stock_board_map
+
+      - name: Seed runtime stock_daily features from gp-board
+        run: |
+          python -m my_stock common seed-tree-copy \
+            --source "${GP_REPOS_ROOT}/gp-board/features/stock_daily" \
+            --target "${GP_RUNTIME_ROOT}/board/features/stock_daily"
+
+      - name: Build stock-level board features
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [ -n "${{ needs.resolve_inputs.outputs.snapshot_date }}" ]; then
+            EXTRA_ARGS+=(--snapshot-date "${{ needs.resolve_inputs.outputs.snapshot_date }}")
+          fi
+          python -m my_stock board build-stock-features \
+            --input "${GP_REPOS_ROOT}/gp-board/features/bk" \
+            --stock-map-dir "${GP_REPOS_ROOT}/gp-board/meta/stock_board_map" \
+            --output "${GP_RUNTIME_ROOT}/board/features/stock_daily" \
+            --manifest-path "${GP_RUNTIME_ROOT}/board/features/stock_daily/manifest.json" \
+            --start "${{ needs.resolve_inputs.outputs.start }}" \
+            --end "${{ needs.resolve_inputs.outputs.end }}" \
+            --partition-grain "${{ needs.resolve_inputs.outputs.partition_grain }}" \
+            "${EXTRA_ARGS[@]}" \
+            --no-push \
+            --summary-output "${RUNNER_TEMP}/board-stock-features-summary.json"
+
+      - name: Publish runtime stock_daily features to gp-board
+        run: |
+          python -m my_stock common publish-tree \
+            --source "${GP_RUNTIME_ROOT}/board/features/stock_daily" \
+            --target "${GP_REPOS_ROOT}/gp-board/features/stock_daily" \
+            --repo-dir "${GP_REPOS_ROOT}/gp-board" \
+            --git-paths "features/stock_daily" \
+            --message "board-stock-features: update ${{ needs.resolve_inputs.outputs.start }} to ${{ needs.resolve_inputs.outputs.end }}"
+
+      - name: Upload stock feature summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: board-stock-features-summary
+          path: ${{ runner.temp }}/board-stock-features-summary.json
+          if-no-files-found: error
+          retention-days: 7
