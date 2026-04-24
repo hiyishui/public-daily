@@ -186,17 +186,11 @@ jobs:
       - name: Compute lookback start
         id: lookback
         run: |
-          set -euo pipefail
-          LOOKBACK_START=$(python -c "
-          import json, pathlib
-          td = json.loads(pathlib.Path('my-stock-src/data/basic/trade_date.json').read_text())
-          dates = sorted(d.replace('-','') if '-' in str(d) else str(d) for d in (td.get('trade_dates', td) if isinstance(td, dict) else td))
-          target = '${TARGET_DATE}'
-          idx = next((i for i, d in enumerate(dates) if d >= target), len(dates))
-          lb = max(0, idx - 60)
-          print(dates[lb])
-          ")
-          echo "lookback_start=${LOOKBACK_START}" >> "$GITHUB_OUTPUT"
+          python -m my_stock common resolve-lookback-date \
+            --date "${TARGET_DATE}" \
+            --lookback 60 \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: "L2H: Derive history features"
         run: |
@@ -263,18 +257,10 @@ jobs:
       - name: Compute L2F target date (T-11)
         id: l2f
         run: |
-          set -euo pipefail
-          L2F_TARGET=$(python -c "
-          import json, pathlib, datetime, zoneinfo
-          td = json.loads(pathlib.Path('my-stock-src/data/basic/trade_date.json').read_text())
-          dates = sorted(d.replace('-','') if '-' in str(d) else str(d) for d in (td.get('trade_dates', td) if isinstance(td, dict) else td))
-          today = datetime.datetime.now(tz=zoneinfo.ZoneInfo('Asia/Shanghai')).strftime('%Y%m%d')
-          idx = next((i for i, d in enumerate(dates) if d >= today), len(dates)) - 1
-          target = dates[max(0, idx - 11)]
-          print(target)
-          ")
-          echo "target_date=${L2F_TARGET}" >> "$GITHUB_OUTPUT"
-          echo "L2F target date: ${L2F_TARGET}"
+          python -m my_stock common resolve-future-trade-date \
+            --offset 11 \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: "L2F: Derive future features"
         run: |

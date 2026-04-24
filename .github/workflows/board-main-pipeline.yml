@@ -80,8 +80,9 @@ jobs:
         id: shards
         run: |
           TOTAL=${{ github.event.inputs.shard_total || '20' }}
-          echo "shard_total=${TOTAL}" >> "$GITHUB_OUTPUT"
-          python3 -c "import json; print('shard_matrix=' + json.dumps({'shard_index': list(range(int('${TOTAL}')))}))" >> "$GITHUB_OUTPUT"
+          python -m my_stock common generate-shard-matrix \
+            --total "${TOTAL}" \
+            --github-output "$GITHUB_OUTPUT"
 
   skip_pipeline:
     runs-on: ubuntu-latest
@@ -230,115 +231,14 @@ jobs:
           END_DATE: ${{ needs.resolve_inputs.outputs.end }}
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          import pandas as pd
-
-          from my_stock.board.models import BoardFailure
-          from my_stock.board.storage import (
-              build_manifest,
-              read_meta,
-              write_failures,
-              write_manifest,
-              write_partitioned_frame,
-          )
-
-          shards_dir = Path(os.environ["RUNNER_TEMP"]) / "shards"
-          output_dir = Path(os.environ["GP_RUNTIME_ROOT"]) / "board" / "raw" / "bk"
-          partition_grain = os.environ["PARTITION_GRAIN"]
-          meta_path = Path(os.environ["GP_REPOS_ROOT"]) / "gp-board" / "meta" / "board_codes.csv"
-
-          # Collect all shard parquets into one DataFrame
-          all_frames: list[pd.DataFrame] = []
-          all_failures: list[BoardFailure] = []
-          shard_summaries: list[dict] = []
-
-          for shard_dir in sorted(shards_dir.iterdir()):
-              if not shard_dir.is_dir():
-                  continue
-              # Read parquets (may be in year subdirs or root)
-              for pq_path in sorted(shard_dir.rglob("*.parquet")):
-                  df = pd.read_parquet(pq_path)
-                  if not df.empty:
-                      all_frames.append(df)
-              # Collect failures
-              for name in ("failures.json", "failures_binary.json"):
-                  fp = shard_dir / name
-                  if fp.exists():
-                      try:
-                          items = json.loads(fp.read_text(encoding="utf-8"))
-                          for item in items:
-                              all_failures.append(
-                                  BoardFailure(
-                                      secid=str(item.get("secid", "")),
-                                      name=str(item.get("name", "")),
-                                      error=str(item.get("error", "")),
-                                  )
-                              )
-                      except Exception:
-                          pass
-                  break  # Only read failures once per shard (failures.json == failures_binary.json)
-              # Collect summaries
-              summary_path = shard_dir / "summary.json"
-              if summary_path.exists():
-                  try:
-                      shard_summaries.append(json.loads(summary_path.read_text(encoding="utf-8")))
-                  except Exception:
-                      pass
-
-          # Deduplicate failures by secid
-          seen_secids: set[str] = set()
-          unique_failures: list[BoardFailure] = []
-          for f in all_failures:
-              if f.secid not in seen_secids:
-                  seen_secids.add(f.secid)
-                  unique_failures.append(f)
-
-          print(f"Shards found: {len(list(shards_dir.iterdir()))}")
-          print(f"Total parquet frames: {len(all_frames)}")
-          print(f"Total unique failures: {len(unique_failures)}")
-
-          # Merge shard data into runtime output (which already has existing gp-board data)
-          if all_frames:
-              combined = pd.concat(all_frames, ignore_index=True)
-              print(f"Combined rows: {len(combined)}")
-              write_partitioned_frame(output_dir, combined, grain=partition_grain, entity_label="boards")
-
-          # Write combined failures
-          failures_path = output_dir / "failures.json"
-          binary_failures_path = output_dir / "failures_binary.json"
-          write_failures(failures_path, unique_failures)
-          write_failures(binary_failures_path, unique_failures)
-
-          # Build and write combined manifest
-          boards = read_meta(meta_path)
-          manifest = build_manifest(
-              output_dir,
-              boards,
-              unique_failures,
-              start=os.environ["START_DATE"],
-              end=os.environ["END_DATE"],
-              source="binary socket protocol (port 1861) — 18-shard parallel fetch",
-          )
-          write_manifest(output_dir / "manifest.json", manifest)
-
-          # Write combined summary
-          combined_summary = {
-              "start": os.environ["START_DATE"],
-              "end": os.environ["END_DATE"],
-              "board_count": len(boards),
-              "remaining_failure_count": len(unique_failures),
-              "partition_grain": partition_grain,
-              "shard_count": len(shard_summaries),
-              "shard_summaries": shard_summaries,
-          }
-          summary_out = Path(os.environ["RUNNER_TEMP"]) / "board-binary-summary.json"
-          summary_out.write_text(json.dumps(combined_summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-          print("Merge complete.")
-          PY
+          python -m my_stock board merge-history-shards \
+            --shards-dir "${RUNNER_TEMP}/shards" \
+            --output-dir "${GP_RUNTIME_ROOT}/board/raw/bk" \
+            --meta-path "${GP_REPOS_ROOT}/gp-board/meta/board_codes.csv" \
+            --start "${START_DATE}" \
+            --end "${END_DATE}" \
+            --partition-grain "${PARTITION_GRAIN}" \
+            --summary-output "${RUNNER_TEMP}/board-binary-summary.json"
 
       - name: Publish runtime raw board data to gp-board
         run: |

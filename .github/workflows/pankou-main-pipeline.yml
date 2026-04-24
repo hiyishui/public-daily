@@ -323,19 +323,10 @@ jobs:
 
       - name: Merge shard parquets
         run: |
-          python -c "
-          import pathlib, pandas as pd
-          shards = sorted(pathlib.Path('${RUNNER_TEMP}/base_shards').rglob('*.parquet'))
-          print(f'Merging {len(shards)} shard parquet(s)')
-          frames = [pd.read_parquet(p) for p in shards]
-          merged = pd.concat(frames, ignore_index=True).sort_values(['secid','date']).reset_index(drop=True)
-          compact = '${{ matrix.date }}'.replace('-','')
-          year = compact[:4]
-          out = pathlib.Path('${RUNNER_TEMP}/gp-data/runtime/pankou/base/pankou') / year / f'{compact}.parquet'
-          out.parent.mkdir(parents=True, exist_ok=True)
-          merged.to_parquet(out, index=False)
-          print(f'Written {len(merged)} rows to {out}')
-          "
+          python -m my_stock pankou merge-base-shards \
+            --shards-dir "${RUNNER_TEMP}/base_shards" \
+            --date "${{ matrix.date }}" \
+            --output-dir "${RUNNER_TEMP}/gp-data/runtime/pankou/base/pankou"
 
       - name: Sync gp-pankou (sparse)
         run: |
@@ -469,23 +460,10 @@ jobs:
 
       - name: Merge shard derived parquets
         run: |
-          python -c "
-          import pathlib, pandas as pd
-          compact = '${{ matrix.date }}'.replace('-','')
-          year = compact[:4]
-          runtime = pathlib.Path('${RUNNER_TEMP}/gp-data/runtime/pankou/derived')
-          for sub in ['market_structure', 'trade_behavior']:
-              shards = sorted(pathlib.Path('${RUNNER_TEMP}/derived_shards').rglob(f'{sub}/**/*.parquet'))
-              if not shards:
-                  shards = sorted(pathlib.Path('${RUNNER_TEMP}/derived_shards').rglob(f'**/{sub}/{year}/{compact}.parquet'))
-              print(f'{sub}: merging {len(shards)} shard(s)')
-              frames = [pd.read_parquet(p) for p in shards]
-              merged = pd.concat(frames, ignore_index=True).sort_values('secid').reset_index(drop=True)
-              out = runtime / sub / year / f'{compact}.parquet'
-              out.parent.mkdir(parents=True, exist_ok=True)
-              merged.to_parquet(out, index=False)
-              print(f'{sub}: {len(merged)} rows -> {out}')
-          "
+          python -m my_stock pankou merge-derived-shards \
+            --shards-dir "${RUNNER_TEMP}/derived_shards" \
+            --date "${{ matrix.date }}" \
+            --output-dir "${RUNNER_TEMP}/gp-data/runtime/pankou/derived"
 
       - name: Sync gp-derived
         run: |
@@ -545,19 +523,11 @@ jobs:
       - name: Compute L2F target date
         id: l2f
         run: |
-          set -euo pipefail
-          L2F_TARGET=$(python -c "
-          import json, pathlib, datetime, zoneinfo
-          td = json.loads(pathlib.Path('my-stock-src/data/basic/trade_date.json').read_text())
-          dates = sorted(d.replace('-','') if '-' in str(d) else str(d) for d in (td.get('trade_dates', td) if isinstance(td, dict) else td))
-          today = datetime.datetime.now(tz=zoneinfo.ZoneInfo('Asia/Shanghai')).strftime('%Y%m%d')
-          idx = next((i for i, d in enumerate(dates) if d >= today), len(dates)) - 1
-          window = int('${INPUT_FUTURE_WINDOW}')
-          target = dates[max(0, idx - window - 1)]
-          print(target)
-          ")
-          echo "target_date=${L2F_TARGET}" >> "$GITHUB_OUTPUT"
-          echo "L2F target date: ${L2F_TARGET}"
+          OFFSET=$(( INPUT_FUTURE_WINDOW + 1 ))
+          python -m my_stock common resolve-future-trade-date \
+            --offset "${OFFSET}" \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Resolve sparse paths for gp-pankou
         id: sparse
@@ -629,18 +599,11 @@ jobs:
       - name: Compute L2F target date
         id: l2f
         run: |
-          set -euo pipefail
-          L2F_TARGET=$(python -c "
-          import json, pathlib, datetime, zoneinfo
-          td = json.loads(pathlib.Path('my-stock-src/data/basic/trade_date.json').read_text())
-          dates = sorted(d.replace('-','') if '-' in str(d) else str(d) for d in (td.get('trade_dates', td) if isinstance(td, dict) else td))
-          today = datetime.datetime.now(tz=zoneinfo.ZoneInfo('Asia/Shanghai')).strftime('%Y%m%d')
-          idx = next((i for i, d in enumerate(dates) if d >= today), len(dates)) - 1
-          window = int('${INPUT_FUTURE_WINDOW}')
-          target = dates[max(0, idx - window - 1)]
-          print(target)
-          ")
-          echo "target_date=${L2F_TARGET}" >> "$GITHUB_OUTPUT"
+          OFFSET=$(( INPUT_FUTURE_WINDOW + 1 ))
+          python -m my_stock common resolve-future-trade-date \
+            --offset "${OFFSET}" \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Download all future shard parquets
         uses: actions/download-artifact@v5
@@ -650,34 +613,10 @@ jobs:
 
       - name: Merge shard future parquets and recompute z-scores
         run: |
-          python -c "
-          import pathlib, numpy as np, pandas as pd
-          target = '${{ steps.l2f.outputs.target_date }}'
-          year = target[:4]
-          runtime = pathlib.Path('${RUNNER_TEMP}/gp-data/runtime/pankou/derived')
-          shards = sorted(pathlib.Path('${RUNNER_TEMP}/future_shards').rglob('**/*.parquet'))
-          print(f'future: merging {len(shards)} shard(s)')
-          frames = [pd.read_parquet(p) for p in shards]
-          merged = pd.concat(frames, ignore_index=True).sort_values('secid').reset_index(drop=True)
-          # Recompute cross-sectional z-scores on full dataset
-          for col in ('future_ret_5', 'future_ret_20'):
-              z_col = f'{col}_z'
-              values = pd.to_numeric(merged[col], errors='coerce').to_numpy(dtype=float)
-              finite = np.isfinite(values)
-              if finite.sum() >= 8:
-                  mean = float(np.nanmean(values))
-                  std = float(np.nanstd(values))
-                  if std > 1e-12:
-                      merged[z_col] = np.where(finite, (values - mean) / std, np.nan)
-                  else:
-                      merged[z_col] = np.where(finite, 0.0, np.nan)
-              else:
-                  merged[z_col] = np.nan
-          out = runtime / 'future' / year / f'{target}.parquet'
-          out.parent.mkdir(parents=True, exist_ok=True)
-          merged.to_parquet(out, index=False)
-          print(f'future: {len(merged)} rows -> {out}')
-          "
+          python -m my_stock pankou merge-future-shards \
+            --shards-dir "${RUNNER_TEMP}/future_shards" \
+            --date "${{ steps.l2f.outputs.target_date }}" \
+            --output-dir "${RUNNER_TEMP}/gp-data/runtime/pankou/derived"
 
       - name: Sync gp-derived
         run: |
