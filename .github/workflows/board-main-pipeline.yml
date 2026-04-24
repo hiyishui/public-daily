@@ -13,6 +13,11 @@ on:
         required: false
         default: ""
         type: string
+      shard_total:
+        description: "抓取并行分片数（每个分片一个独立 runner/IP）；默认 20，限流严重时可调到 60"
+        required: false
+        default: "20"
+        type: string
   # schedule:
   #   - cron: "45 12 * * 1-5"
 
@@ -33,6 +38,8 @@ jobs:
       should_run: ${{ steps.range.outputs.should_run }}
       skip_reason: ${{ steps.range.outputs.skip_reason }}
       snapshot_date: ${{ steps.range.outputs.snapshot_date }}
+      shard_total: ${{ steps.shards.outputs.shard_total }}
+      shard_matrix: ${{ steps.shards.outputs.shard_matrix }}
     env:
       INPUT_DATE_RANGE: ${{ github.event.inputs.date_range || '' }}
       INPUT_SNAPSHOT_DATE: ${{ github.event.inputs.snapshot_date || '' }}
@@ -69,6 +76,13 @@ jobs:
             --snapshot-date "${INPUT_SNAPSHOT_DATE}" \
             --github-output "$GITHUB_OUTPUT"
 
+      - name: Generate shard matrix
+        id: shards
+        run: |
+          TOTAL=${{ github.event.inputs.shard_total || '20' }}
+          echo "shard_total=${TOTAL}" >> "$GITHUB_OUTPUT"
+          python3 -c "import json; print('shard_matrix=' + json.dumps({'shard_index': list(range(int('${TOTAL}')))}))" >> "$GITHUB_OUTPUT"
+
   skip_pipeline:
     runs-on: ubuntu-latest
     needs: resolve_inputs
@@ -85,9 +99,8 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 18
-      matrix:
-        shard_index: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.resolve_inputs.outputs.shard_matrix) }}
     env:
       GP_CODE_GITHUB_OWNER: hiyishui
       GP_DATA_GITHUB_OWNER: larkself
@@ -96,7 +109,7 @@ jobs:
       DATA_GITHUB_PAT: ${{ secrets.LARKSELF_PAT }}
       CODE_GITHUB_PAT: ${{ secrets.HIYISHUI_PAT }}
       MY_STOCK_PROJECT_ROOT: ${{ github.workspace }}/my-stock-src
-      SHARD_TOTAL: 18
+      SHARD_TOTAL: ${{ needs.resolve_inputs.outputs.shard_total }}
     steps:
       - name: Check out my-stock source repo
         uses: actions/checkout@v4
