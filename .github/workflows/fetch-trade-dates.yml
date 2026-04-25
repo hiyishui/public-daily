@@ -9,7 +9,7 @@ name: 交易日更新
 
 on:
   schedule:
-    - cron: '0 18 * * 5'  # UTC 18:00 Fri = 北京 02:00 Sat, 每周更新一次
+    - cron: '0 1 * * 6'  # UTC 18:00 Fri = 北京 02:00 Sat, 每周更新一次
   workflow_dispatch:
 
 permissions:
