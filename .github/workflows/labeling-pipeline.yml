@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       publish:
-        description: "审计通过后是否推送到 larkself/gp-labels-v2"
+        description: "审计通过后是否推送到 larkself/gp-labels (data/labels/<YYYY>/<YYYYMM>/<YYYYMMDD>.parquet)"
         required: false
         default: "false"
         type: choice
@@ -186,7 +186,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Publish to gp-labels-v2
+      - name: Publish to gp-labels
         if: env.INPUT_PUBLISH == 'true' && steps.leakage.outputs.leakage_ok == 'true'
         shell: bash
         run: |
