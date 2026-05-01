@@ -528,12 +528,16 @@ jobs:
 
       - name: Compute L2F target date
         id: l2f
+        env:
+          ANCHOR_DATE: ${{ needs.prepare.outputs.resolved_date }}
         run: |
-          # 目标日 T 应满足 T 的第 future_window 个未来交易日 = 最近一个已收盘交易日
-          # （例：日常跑 today_last=20260427、future_window=20 → target=20260407）
+          # 锡定锡点为 prepare 产出的 resolved_date（与 download 完全一致）。
+          # 目标日 T = anchor - future_window 个交易日，
+          # 即 anchor 是 T 的第 future_window 个未来交易日。
           OFFSET="${INPUT_FUTURE_WINDOW}"
           python -m my_stock common resolve-future-trade-date \
             --offset "${OFFSET}" \
+            --anchor "${ANCHOR_DATE}" \
             --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
             --github-output "$GITHUB_OUTPUT"
 
@@ -606,11 +610,14 @@ jobs:
 
       - name: Compute L2F target date
         id: l2f
+        env:
+          ANCHOR_DATE: ${{ needs.prepare.outputs.resolved_date }}
         run: |
-          # 与 derive_future_shard 保持一致：OFFSET = future_window
+          # 与 derive_future_shard 保持一致：OFFSET = future_window，锡点为 prepare.resolved_date
           OFFSET="${INPUT_FUTURE_WINDOW}"
           python -m my_stock common resolve-future-trade-date \
             --offset "${OFFSET}" \
+            --anchor "${ANCHOR_DATE}" \
             --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
             --github-output "$GITHUB_OUTPUT"
 
