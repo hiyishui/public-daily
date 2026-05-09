@@ -58,63 +58,7 @@ jobs:
           echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
           echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
 
-      - name: Resolve target date
-        id: target
-        shell: bash
-        run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          import os
-          from datetime import datetime, timedelta, timezone
-          from pathlib import Path
-
-          try:
-              from zoneinfo import ZoneInfo
-          except ImportError:  # pragma: no cover
-              ZoneInfo = None
-
-          cn_tz = ZoneInfo("Asia/Shanghai") if ZoneInfo else timezone(timedelta(hours=8))
-          payload = json.loads(Path("my-stock-src/data/basic/trade_date.json").read_text(encoding="utf-8"))
-          raw_dates = payload.get("trade_dates", payload)
-          trade_dates = sorted(
-              {
-                  str(value).strip()[:10].replace("-", "")
-                  for value in raw_dates
-                  if str(value).strip()
-              }
-          )
-          trade_set = set(trade_dates)
-          anchor_input = os.environ.get("INPUT_ANCHOR_DATE", "").strip().replace("-", "")
-          anchor = anchor_input or datetime.now(cn_tz).strftime("%Y%m%d")
-          offset = int(os.environ.get("LABEL_TARGET_OFFSET", "21"))
-
-          if anchor not in trade_set:
-              print("has_work=false")
-              print(f"skip_reason={anchor} 不是交易日，跳过老师标签生成")
-              print(f"anchor_date={anchor}")
-              raise SystemExit(0)
-
-          anchor_index = trade_dates.index(anchor)
-          target_index = anchor_index - offset
-          if target_index < 0:
-              print("has_work=false")
-              print(f"skip_reason=交易日历不足以从 {anchor} 向前 {offset} 个交易日")
-              print(f"anchor_date={anchor}")
-              raise SystemExit(0)
-
-          target = trade_dates[target_index]
-          print("has_work=true")
-          print(f"anchor_date={anchor}")
-          print(f"target_date={target}")
-          print(f"date_source={target}~{target}")
-          PY
-
-      - name: Print skip reason
-        if: steps.target.outputs.has_work != 'true'
-        run: echo "${{ steps.target.outputs.skip_reason }}"
-
       - name: Set up Python
-        if: steps.target.outputs.has_work == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -122,10 +66,22 @@ jobs:
           cache-dependency-path: my-stock-src/pyproject.toml
 
       - name: Install project dependencies
-        if: steps.target.outputs.has_work == 'true'
         run: |
           python -m pip install --upgrade pip
           for i in 1 2 3; do python -m pip install ./my-stock-src && break || sleep 5; done
+
+      - name: Resolve target date
+        id: target
+        run: |
+          python -m my_stock labeling resolve-forward-date \
+            --anchor-date "${INPUT_ANCHOR_DATE}" \
+            --offset "${LABEL_TARGET_OFFSET}" \
+            --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Print skip reason
+        if: steps.target.outputs.has_work != 'true'
+        run: echo "${{ steps.target.outputs.skip_reason }}"
 
       - name: Sync label input repos
         if: steps.target.outputs.has_work == 'true'
@@ -144,23 +100,8 @@ jobs:
       - name: Validate generated rows
         if: steps.target.outputs.has_work == 'true'
         run: |
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          summary = Path(os.environ["RUNNER_TEMP"]) / "generate-labels-summary.json"
-          payload = json.loads(summary.read_text(encoding="utf-8"))
-          rows = int(payload.get("rows") or 0)
-          if rows <= 0:
-              raise SystemExit(f"no labels generated for {payload.get('target_dates')}")
-          print(json.dumps({
-              "target_dates": payload.get("target_dates"),
-              "rows": rows,
-              "skipped_missing_future_rows": payload.get("skipped_missing_future_rows"),
-              "pushed": payload.get("pushed"),
-          }, ensure_ascii=False, indent=2))
-          PY
+          python -m my_stock labeling validate-generate-summary \
+            --summary "${RUNNER_TEMP}/generate-labels-summary.json"
 
       - name: Upload summary
         if: always() && steps.target.outputs.has_work == 'true'
