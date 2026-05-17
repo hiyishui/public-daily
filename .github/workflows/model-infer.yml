@@ -1,7 +1,7 @@
 # 功能：
 # - 每个交易日收盘后运行最新模型推理，并把全市场 as-of 推理结果发布到 larkself/gp-infer。
 # - 同步构建 gp-reports 模型推理页面壳，使 https://gp-reports.pages.dev/model-infer/ 可通过 PAT 动态读取私有 gp-infer。
-# - gp-infer 永久保留每日 predictions.parquet/index/candidates，stocks JSON 交互缓存仅保留最近若干交易日。
+# - gp-infer 永久保留每日 predictions.parquet/index/candidates，stocks JSON 推理 overlay 缓存仅保留最近若干交易日。
 #
 # 用法：
 # - 支持 workflow_dispatch 手动补跑指定 end。
@@ -23,7 +23,7 @@ on:
         default: "20"
         type: string
       history_bars:
-        description: "每只股票交互 K 线缓存的历史交易日数量"
+        description: "每只股票推理 overlay 缓存的历史交易日数量；报告页按该窗口请求东方财富 K 线"
         required: false
         default: "488"
         type: string
@@ -136,8 +136,7 @@ jobs:
             --min-history-days 20 \
             --allow-missing-market-context \
             --predictions-output "${RUNNER_TEMP}/model-infer/predictions.parquet" \
-            --candidates-output "${RUNNER_TEMP}/model-infer/ranked_candidates.csv" \
-            --candidates-json-output "${RUNNER_TEMP}/model-infer/ranked_candidates.json" \
+            --no-ranked-candidates \
             --summary-output "${RUNNER_TEMP}/model-infer-summary.json"
 
       - name: Sync previous gp-infer cache
@@ -150,8 +149,6 @@ jobs:
         run: |
           python -m my_stock model publish-infer \
             --predictions "${RUNNER_TEMP}/model-infer/predictions.parquet" \
-            --ranked-candidates-csv "${RUNNER_TEMP}/model-infer/ranked_candidates.csv" \
-            --ranked-candidates-json "${RUNNER_TEMP}/model-infer/ranked_candidates.json" \
             --previous-cache-root "${GP_REPOS_ROOT}/gp-infer" \
             --end "${{ steps.range.outputs.end }}" \
             --top-per-stage "${INPUT_TOP_PER_STAGE}" \
@@ -182,7 +179,5 @@ jobs:
             ${{ runner.temp }}/report-build-site-summary.json
             ${{ runner.temp }}/report-build-model-infer-site-summary.json
             ${{ runner.temp }}/report-publish-site-summary.json
-            ${{ runner.temp }}/model-infer/ranked_candidates.csv
-            ${{ runner.temp }}/model-infer/ranked_candidates.json
           if-no-files-found: warn
           retention-days: 14
