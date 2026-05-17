@@ -27,6 +27,11 @@ on:
         required: false
         default: "488"
         type: string
+      infer_lookback_bars:
+        description: "每日模型推理实际回看交易日数量；历史 K 线优先复用上一期缓存补足"
+        required: false
+        default: "80"
+        type: string
       stock_cache_retention_days:
         description: "保留 stocks JSON 缓存的最近交易日数量"
         required: false
@@ -61,6 +66,7 @@ jobs:
       INPUT_END: ${{ github.event.inputs.end || '' }}
       INPUT_TOP_PER_STAGE: ${{ github.event.inputs.top_per_stage || '20' }}
       INPUT_HISTORY_BARS: ${{ github.event.inputs.history_bars || '488' }}
+      INPUT_INFER_LOOKBACK_BARS: ${{ github.event.inputs.infer_lookback_bars || '80' }}
       INPUT_STOCK_CACHE_RETENTION_DAYS: ${{ github.event.inputs.stock_cache_retention_days || '60' }}
 
     steps:
@@ -100,7 +106,7 @@ jobs:
             --date-range "${INPUT_END}" \
             --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
             --workflow-name "model-infer-publish" \
-            --precision day \
+            --precision auto \
             --check-close \
             --github-output "$GITHUB_OUTPUT"
 
@@ -114,7 +120,7 @@ jobs:
         run: |
           python -m my_stock common resolve-lookback-date \
             --date "${{ steps.range.outputs.end }}" \
-            --lookback "${INPUT_HISTORY_BARS}" \
+            --lookback "${INPUT_INFER_LOOKBACK_BARS}" \
             --trade-dates-file "${GITHUB_WORKSPACE}/my-stock-src/data/basic/trade_date.json" \
             --github-output "$GITHUB_OUTPUT"
 
@@ -134,6 +140,11 @@ jobs:
             --candidates-json-output "${RUNNER_TEMP}/model-infer/ranked_candidates.json" \
             --summary-output "${RUNNER_TEMP}/model-infer-summary.json"
 
+      - name: Sync previous gp-infer cache
+        if: steps.range.outputs.should_run == 'true'
+        run: |
+          python -m my_stock common sync-repo gp-infer || true
+
       - name: Export and publish gp-infer data
         if: steps.range.outputs.should_run == 'true'
         run: |
@@ -141,6 +152,7 @@ jobs:
             --predictions "${RUNNER_TEMP}/model-infer/predictions.parquet" \
             --ranked-candidates-csv "${RUNNER_TEMP}/model-infer/ranked_candidates.csv" \
             --ranked-candidates-json "${RUNNER_TEMP}/model-infer/ranked_candidates.json" \
+            --previous-cache-root "${GP_REPOS_ROOT}/gp-infer" \
             --end "${{ steps.range.outputs.end }}" \
             --top-per-stage "${INPUT_TOP_PER_STAGE}" \
             --history-bars "${INPUT_HISTORY_BARS}" \
