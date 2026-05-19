@@ -40,7 +40,7 @@ on:
   schedule:
     # 21:45 Asia/Shanghai on weekdays. The prepare step still checks the
     # exchange calendar, so holidays are handled by trade_date.json.
-    - cron: "45 13 * * 1-5"
+    # - cron: "45 13 * * 1-5"
 
 permissions:
   contents: read
