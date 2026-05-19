@@ -37,10 +37,10 @@ on:
         required: false
         default: "60"
         type: string
-  schedule:
-    # 21:45 Asia/Shanghai on weekdays. The prepare step still checks the
-    # exchange calendar, so holidays are handled by trade_date.json.
-    # - cron: "45 13 * * 1-5"
+  # schedule:
+  #   # 21:45 Asia/Shanghai on weekdays. The prepare step still checks the
+  #   # exchange calendar, so holidays are handled by trade_date.json.
+  #   - cron: "45 13 * * 1-5"
 
 permissions:
   contents: read
@@ -83,9 +83,11 @@ jobs:
 
       - name: Resolve runtime roots
         run: |
-          echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data" >> "$GITHUB_ENV"
-          echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos" >> "$GITHUB_ENV"
-          echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime" >> "$GITHUB_ENV"
+          {
+            echo "GP_DATA_ROOT=${RUNNER_TEMP}/gp-data"
+            echo "GP_REPOS_ROOT=${RUNNER_TEMP}/gp-data/repos"
+            echo "GP_RUNTIME_ROOT=${RUNNER_TEMP}/gp-data/runtime"
+          } >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -97,7 +99,15 @@ jobs:
       - name: Install project dependencies
         run: |
           python -m pip install --upgrade pip
-          for i in 1 2 3; do python -m pip install './my-stock-src[ml]' && break || sleep 5; done
+          for attempt in 1 2 3; do
+            if python -m pip install './my-stock-src[ml]'; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep 5
+          done
 
       - name: Resolve target date
         id: range
